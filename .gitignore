@@ -1,0 +1,21 @@
+# Build artifacts
+build/
+*.o
+*.out
+*.exe
+core
+core.*
+
+# valgrind / sanitizer / coverage output
+*.vgcore
+massif.out.*
+*.gcov
+*.gcda
+*.gcno
+
+# Editor/OS cruft
+.vscode/
+.vs/
+*.swp
+.DS_Store
+Thumbs.db
