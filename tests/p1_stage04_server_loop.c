@@ -24,6 +24,7 @@
 
 #include "kv/net.h"
 #include "kv/server.h"
+#include "kv/store.h"
 #include "test_framework.h"
 #include "helpers/test_client.h"
 
@@ -163,5 +164,16 @@ int main(void) {
     with_server(scenario_pipelined_requests_get_ordered_responses);
     kv_test_current = "scenario_frame_split_across_two_writes";
     with_server(scenario_frame_split_across_two_writes);
+
+    /* This test calls kv_handle_client() directly (see the file-level
+     * comment above) rather than through kv_run_server(), which is the
+     * only place that calls kv_store_destroy() on shutdown. Since
+     * Phase 2 Stage 3 wired the store into kv_handle_client's dispatch,
+     * the SET in scenario_set_get_delete_get leaves an entry allocated
+     * that nothing would otherwise free before this process exits --
+     * clean it up explicitly instead of leaving it for valgrind to
+     * (correctly) flag as still-reachable. */
+    kv_store_destroy();
+
     KV_REPORT_AND_EXIT();
 }

@@ -11,14 +11,11 @@
 #include "kv/command.h"
 #include "kv/net.h"
 #include "kv/protocol.h"
-
+#include "kv/store.h"
 
 #define KV_CONN_BUF_CAP (KV_HEADER_LEN + KV_MAX_PAYLOAD_LEN)
 
-/*
- * Send all bytes in the buffer.
- * send() may send only part of the data, so keep calling it until everything is sent.
- */
+/* Send all bytes in the buffer. */
 static int send_all(int fd, const uint8_t *buf, size_t len) {
     size_t sent = 0;
 
@@ -37,51 +34,72 @@ static int send_all(int fd, const uint8_t *buf, size_t len) {
     return 0;
 }
 
-/*
- * Decide what response to send for each command.
- * Temporary stub, real storage logic will be added later.
- */
-static void dispatch_stub(const kv_command_t *cmd, uint8_t *resp_opcode) {
-    switch (cmd->type) {
+/* Execute the command and decide what response to send. */
+static void dispatch(const kv_command_t *cmd, uint8_t *resp_opcode,
+                      uint8_t **owned_payload, uint32_t *owned_payload_len) {
+    *owned_payload = NULL;
+    *owned_payload_len = 0;
 
-    // PING gets a PONG response. 
+    switch (cmd->type) {
     case KV_CMD_PING:
         *resp_opcode = KV_OP_PONG;
         break;
 
-    // GET always returns NOT_FOUND for now.
-    case KV_CMD_GET:
-        *resp_opcode = KV_OP_NOT_FOUND;
-        break;
+    case KV_CMD_GET: {
+        uint8_t *value = NULL;
+        uint32_t value_len = 0;
 
-    // SET and DELETE return OK for now.
-    case KV_CMD_SET:
-    case KV_CMD_DELETE:
-        *resp_opcode = KV_OP_OK;
+        int rc = kv_store_get(cmd->key, cmd->key_len, &value, &value_len);
+
+        if (rc == 1) {
+            *resp_opcode = KV_OP_VALUE;
+            *owned_payload = value;
+            *owned_payload_len = value_len;
+        } else if (rc == 0) {
+            *resp_opcode = KV_OP_NOT_FOUND;
+        } else {
+            *resp_opcode = KV_OP_ERR;
+        }
         break;
     }
-}
 
+    case KV_CMD_SET: {
+        int rc = kv_store_set(
+            cmd->key,
+            cmd->key_len,
+            cmd->value,
+            cmd->value_len
+        );
+
+        *resp_opcode = (rc == 0) ? KV_OP_OK : KV_OP_ERR;
+        break;
+    }
+
+    case KV_CMD_DELETE: {
+        int rc = kv_store_delete(cmd->key, cmd->key_len);
+
+        *resp_opcode = (rc == 1) ? KV_OP_OK : KV_OP_NOT_FOUND;
+        break;
+    }
+    }
+}
 
 int kv_handle_client(int client_fd) {
 
     // Allocate the connection buffer on the heap.
-    
     uint8_t *buf = malloc(KV_CONN_BUF_CAP);
 
     if (buf == NULL) {
         return -1;
     }
+
     size_t buf_len = 0;
     int result = 0;
 
     // Keep handling requests from this client.
     for (;;) {
 
-        /*
-         * Process any complete frames already in the buffer.
-         * This also allows multiple requests to be processed when they arrive together.
-         */
+        // Process all complete frames currently in the buffer.
         for (;;) {
             kv_frame_t frame;
             int prc = kv_parse_frame(buf, buf_len, &frame);
@@ -96,41 +114,75 @@ int kv_handle_client(int client_fd) {
             }
 
             kv_command_t cmd;
-
             uint8_t resp_header[KV_HEADER_LEN];
 
             if (kv_decode_command(&frame, &cmd) < 0) {
                 result = -1;
                 goto done;
             }
+
             uint8_t resp_opcode = KV_OP_ERR;
+            uint8_t *owned_payload = NULL;
+            uint32_t owned_payload_len = 0;
 
-            dispatch_stub(&cmd, &resp_opcode);
-
-            /*
-             * Create the response frame.
-             * The current stub sends no payload.
-             */
-            size_t resp_len = kv_encode_response(
-                resp_opcode,
-                NULL,
-                0,
-                resp_header,
-                sizeof(resp_header)
+            // Execute the command using the KV store.
+            dispatch(
+                &cmd,
+                &resp_opcode,
+                &owned_payload,
+                &owned_payload_len
             );
 
-            /*
-             * Stop if encoding or sending fails.
-             */
-            if (resp_len == 0 ||
-                send_all(client_fd, resp_header, resp_len) < 0) {
+            int send_failed = 0;
 
+            // Responses without a payload only need the fixed header.
+            if (owned_payload_len == 0) {
+                size_t resp_len = kv_encode_response(
+                    resp_opcode,
+                    NULL,
+                    0,
+                    resp_header,
+                    sizeof(resp_header)
+                );
+
+                if (resp_len == 0 ||
+                    send_all(client_fd, resp_header, resp_len) < 0) {
+                    send_failed = 1;
+                }
+            } else {
+                // GET responses need a buffer large enough for the value.
+                size_t resp_cap = KV_HEADER_LEN + owned_payload_len;
+                uint8_t *resp_buf = malloc(resp_cap);
+
+                if (resp_buf == NULL) {
+                    send_failed = 1;
+                } else {
+                    size_t resp_len = kv_encode_response(
+                        resp_opcode,
+                        owned_payload,
+                        owned_payload_len,
+                        resp_buf,
+                        resp_cap
+                    );
+
+                    if (resp_len == 0 ||
+                        send_all(client_fd, resp_buf, resp_len) < 0) {
+                        send_failed = 1;
+                    }
+
+                    free(resp_buf);
+                }
+            }
+
+            // Free the GET value copy after sending the response.
+            free(owned_payload);
+
+            if (send_failed) {
                 result = -1;
                 goto done;
             }
 
-            // Calculate how many bytes are left in the buffer
-        
+            // Remove the processed frame and keep any remaining bytes.
             size_t remaining = buf_len - frame.frame_len;
 
             if (remaining > 0) {
@@ -144,6 +196,7 @@ int kv_handle_client(int client_fd) {
             buf_len = remaining;
         }
 
+        // Read more data from the client.
         ssize_t n = recv(
             client_fd,
             buf + buf_len,
@@ -152,7 +205,7 @@ int kv_handle_client(int client_fd) {
         );
 
         if (n < 0) {
-            // Retry if recv() was interrupted. 
+            // Retry if recv() was interrupted.
             if (errno == EINTR) {
                 continue;
             }
@@ -162,11 +215,11 @@ int kv_handle_client(int client_fd) {
         }
 
         // recv() returning 0 means the client disconnected.
-         
         if (n == 0) {
             result = 0;
             goto done;
         }
+
         buf_len += (size_t)n;
     }
 
@@ -177,77 +230,108 @@ done:
     return result;
 }
 
-/*
- * Shared state between kv_run_server() (one thread) and
- * kv_stop_server()/kv_server_port() (called from another thread). 
- * Guarded by g_state_mutex throughout.
- */
+/* Shared server state protected by the mutex. */
 static pthread_mutex_t g_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_listen_fd = -1;
 static uint16_t g_port = 0;
 static int g_stop_requested = 0;
 
-// How often the accept loop wakes up on its own to check whether kv_stop_server() was called. 
- 
+// How often the server checks for a stop request.
 #define KV_ACCEPT_POLL_MS 100
 
 int kv_run_server(uint16_t port) {
     int listen_fd = net_listen(port, 16);
-    if (listen_fd < 0) return -1;
 
-    //Set the receive timeout for the listening socket 
+    if (listen_fd < 0) {
+        return -1;
+    }
+
+    // Set a timeout so the accept loop can check the stop flag.
     struct timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = KV_ACCEPT_POLL_MS * 1000;
-    setsockopt(listen_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+    setsockopt(
+        listen_fd,
+        SOL_SOCKET,
+        SO_RCVTIMEO,
+        &tv,
+        sizeof(tv)
+    );
+
+    // Find the actual port used by the socket.
     struct sockaddr_in bound_addr;
     socklen_t bound_len = sizeof(bound_addr);
     uint16_t bound_port = 0;
-    if (getsockname(listen_fd, (struct sockaddr *)&bound_addr, &bound_len) == 0) {
+
+    if (getsockname(
+            listen_fd,
+            (struct sockaddr *)&bound_addr,
+            &bound_len
+        ) == 0) {
         bound_port = ntohs(bound_addr.sin_port);
     }
 
+    // Store the server state safely.
     pthread_mutex_lock(&g_state_mutex);
+
     g_listen_fd = listen_fd;
-    g_port = bound_port; 
+    g_port = bound_port;
     g_stop_requested = 0;
+
     pthread_mutex_unlock(&g_state_mutex);
 
+    // Keep accepting clients until the server is stopped.
     for (;;) {
         pthread_mutex_lock(&g_state_mutex);
         int stop = g_stop_requested;
         pthread_mutex_unlock(&g_state_mutex);
-        if (stop) break;
+
+        if (stop) {
+            break;
+        }
 
         int client_fd = net_accept(listen_fd, NULL);
+
         if (client_fd < 0) {
-        // If accept() failed, check if it was due to a timeout.
             continue;
         }
 
+        // Handle the connected client.
         kv_handle_client(client_fd);
+
         net_close(client_fd);
     }
 
+    // Close the listening socket and reset server state.
     pthread_mutex_lock(&g_state_mutex);
+
     net_close(g_listen_fd);
     g_listen_fd = -1;
     g_port = 0;
+
     pthread_mutex_unlock(&g_state_mutex);
+
+    // Free all memory owned by the KV store.
+    kv_store_destroy();
 
     return 0;
 }
 
 void kv_stop_server(void) {
     pthread_mutex_lock(&g_state_mutex);
+
     g_stop_requested = 1;
+
     pthread_mutex_unlock(&g_state_mutex);
 }
 
 uint16_t kv_server_port(void) {
     pthread_mutex_lock(&g_state_mutex);
+
     uint16_t port = g_port;
+
     pthread_mutex_unlock(&g_state_mutex);
+
     return port;
 }
