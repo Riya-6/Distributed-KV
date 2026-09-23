@@ -13,11 +13,12 @@ HELGRIND_OPTS := --tool=helgrind --error-exitcode=1 --quiet
 BUILD := build
 
 .PHONY: all clean test-p1 valgrind-p1 test-p2 valgrind-p2 test-p3 valgrind-p3 \
-        test-p4 valgrind-p4 helgrind-p4-s2 \
+        test-p4 valgrind-p4 helgrind-p4-s2 test-p5 valgrind-p5 \
         test-p1-s1 test-p1-s2 test-p1-s3 test-p1-s4 test-p1-s5 \
         test-p2-s1 test-p2-s2 test-p2-s3 \
         test-p3-s1 test-p3-s2 test-p3-s3 test-p3-s4 test-p3-s5 test-p3-s6 \
-        test-p4-s1 test-p4-s2 test-p4-s3
+        test-p4-s1 test-p4-s2 test-p4-s3 \
+        test-p5-s1 test-p5-s2
 
 all: test-p1
 
@@ -234,8 +235,50 @@ valgrind-p4: $(P4_BINS)
 helgrind-p4-s2: $(BUILD)/p4_stage02
 	$(VALGRIND) $(HELGRIND_OPTS) ./$(BUILD)/p4_stage02
 
+# --- Phase 5 ---------------------------------------------------------------
+# See docs/stages/phase5-persistence.md. Unlike every earlier phase,
+# these tests don't link server.c/store.c into the test binary itself
+# -- they fork()/exec() a real, standalone server process (built below
+# as $(BUILD)/kv_server, from the new src/main.c) and drive it purely
+# as a client over a real socket, so a real kill -9 has real
+# process-crash semantics. The test binaries themselves only need the
+# client-side pieces (net/protocol/command + test_client) plus the
+# kv_server binary present on disk to exec -- hence kv_server appearing
+# as an order-only prerequisite, not a link dependency, on both.
+
+$(BUILD)/kv_server: src/main.c src/net.c src/protocol.c src/command.c src/server.c src/store.c src/memtable.c src/wal.c src/sstable.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(BUILD)/p5_stage01: tests/p5_stage01_process_restart.c src/net.c src/protocol.c src/command.c tests/helpers/test_client.c | $(BUILD) $(BUILD)/kv_server
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(BUILD)/p5_stage02: tests/p5_stage02_kill_restart.c src/net.c src/protocol.c src/command.c tests/helpers/test_client.c | $(BUILD) $(BUILD)/kv_server
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+P5_BINS := $(BUILD)/p5_stage01 $(BUILD)/p5_stage02
+
+test-p5-s1: $(BUILD)/p5_stage01
+	./$(BUILD)/p5_stage01
+
+test-p5-s2: $(BUILD)/p5_stage02
+	./$(BUILD)/p5_stage02
+
+test-p5: $(P5_BINS)
+	@status=0; \
+	for bin in $(P5_BINS); do \
+		echo "== $$bin =="; \
+		./$$bin || status=1; \
+	done; \
+	exit $$status
+
+# Only the server binary itself is valgrind-checked here -- see
+# phase5-persistence.md's Stage 2 notes for why the fork/kill test
+# drivers aren't run under valgrind themselves.
+valgrind-p5: $(BUILD)/kv_server
+	@echo "valgrind-p5 checks $(BUILD)/kv_server manually -- see docs/stages/phase5-persistence.md"
+
 # ---------------------------------------------------------------------------
-# Later phases (Phase 5 onward) add their own src/test groups and
+# Later phases (Phase 6 onward) add their own src/test groups and
 # test-pN / valgrind-pN targets here, following the same pattern.
 
 clean:

@@ -151,17 +151,16 @@ int kv_wal_replay(const char *path, kv_wal_replay_set_fn on_set,
         kv_frame_t frame;
         int prc = kv_parse_frame(buf + offset, n - offset, &frame);
 
-        if (prc != 1) { /* incomplete or malformed record */
-            free(buf);
-            return -1;
+       
+        if (prc != 1) {
+            break;
         }
 
         kv_command_t cmd;
 
         // Decode the record back into a command.
         if (kv_decode_command(&frame, &cmd) != 0) {
-            free(buf);
-            return -1;
+            break;
         }
 
         // Replay the original operation.
@@ -170,8 +169,7 @@ int kv_wal_replay(const char *path, kv_wal_replay_set_fn on_set,
         } else if (frame.opcode == KV_OP_DELETE) {
             on_delete(cmd.key, cmd.key_len, ctx);
         } else {
-            free(buf);
-            return -1; // WAL should only contain SET/DELETE 
+            break; // WAL should only contain SET/DELETE
         }
 
         // Move to the next record.
