@@ -19,7 +19,10 @@
 #define _DEFAULT_SOURCE
 
 #include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "kv/net.h"
@@ -155,7 +158,19 @@ static void scenario_frame_split_across_two_writes(int client_fd) {
     KV_ASSERT_EQ_BYTES(resp, sizeof(resp), PONG_FRAME, sizeof(PONG_FRAME));
 }
 
+#define TEST_DATA_DIR "build/p1_stage04_data"
+
 int main(void) {
+    /* Phase 3, Stage 5: the store persists to disk now, so it needs a
+     * directory to open before kv_handle_client's dispatch can call
+     * into it at all (see docs/stages/phase3-lsm-tree.md, Stage 5). */
+    system("rm -rf " TEST_DATA_DIR);
+    mkdir(TEST_DATA_DIR, 0755);
+    if (kv_store_open(TEST_DATA_DIR) != 0) {
+        fprintf(stderr, "kv_store_open failed\n");
+        return 1;
+    }
+
     kv_test_current = "scenario_ping_pong";
     with_server(scenario_ping_pong);
     kv_test_current = "scenario_set_get_delete_get";

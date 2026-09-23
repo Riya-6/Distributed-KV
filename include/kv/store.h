@@ -4,6 +4,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+
+int kv_store_open(const char *data_dir);
+
 int kv_store_set(const uint8_t *key, uint16_t key_len, const uint8_t *value,
                   uint32_t value_len);
 

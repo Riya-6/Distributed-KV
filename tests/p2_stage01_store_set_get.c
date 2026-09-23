@@ -4,11 +4,35 @@
  * See docs/stages/phase2-storage.md, Stage 1.
  */
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "kv/store.h"
 #include "test_framework.h"
+
+#define TEST_DATA_DIR "build/p2_stage01_data"
+
+/*
+ * Phase 3, Stage 5: the store persists to disk now (docs/stages/
+ * phase3-lsm-tree.md), so "no init needed, zero value = empty" no
+ * longer holds -- each test needs a fresh, wiped directory opened
+ * before it can call kv_store_*() at all. Wipes+reopens rather than
+ * just destroy()-then-reuse-the-same-dir: a prior test's WAL entries
+ * are still durably on disk after its own kv_store_destroy() call, and
+ * reopening the same directory would replay them right back in,
+ * breaking test isolation.
+ */
+static void reset_and_open(void) {
+    kv_store_destroy();
+    system("rm -rf " TEST_DATA_DIR);
+    mkdir(TEST_DATA_DIR, 0755);
+    if (kv_store_open(TEST_DATA_DIR) != 0) {
+        fprintf(stderr, "kv_store_open failed\n");
+        exit(1);
+    }
+}
 
 static void test_set_then_get_roundtrips(void) {
     KV_ASSERT_EQ_INT(
@@ -99,10 +123,16 @@ static void test_prefix_keys_of_different_lengths_do_not_collide(void) {
 }
 
 int main(void) {
+    reset_and_open();
     KV_RUN(test_set_then_get_roundtrips);
+    reset_and_open();
     KV_RUN(test_get_missing_key_returns_zero);
+    reset_and_open();
     KV_RUN(test_overwrite_existing_key);
+    reset_and_open();
     KV_RUN(test_distinct_keys_do_not_collide);
+    reset_and_open();
     KV_RUN(test_prefix_keys_of_different_lengths_do_not_collide);
+    kv_store_destroy();
     KV_REPORT_AND_EXIT();
 }

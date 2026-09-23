@@ -14,11 +14,15 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "kv/server.h"
+#include "kv/store.h"
 #include "test_framework.h"
 #include "helpers/test_client.h"
+
+#define TEST_DATA_DIR "build/p1_stage05_data"
 
 static const uint8_t PING_FRAME[] = {0xAB, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00};
 static const uint8_t PONG_FRAME[] = {0xAB, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00};
@@ -62,6 +66,16 @@ static void ping_pong_over_new_connection(uint16_t port) {
 static void test_sequential_clients_and_graceful_shutdown(void) {
     signal(SIGALRM, watchdog_handler);
     alarm(10);
+
+    /* Phase 3, Stage 5: the store persists to disk now -- open it
+     * before the server thread starts accepting, since kv_run_server()
+     * calls kv_store_destroy() on shutdown but doesn't open it itself
+     * (open/close lifecycle is the caller's responsibility, separate
+     * from the accept loop's own lifecycle). See docs/stages/
+     * phase3-lsm-tree.md, Stage 5. */
+    system("rm -rf " TEST_DATA_DIR);
+    mkdir(TEST_DATA_DIR, 0755);
+    KV_ASSERT_EQ_INT(kv_store_open(TEST_DATA_DIR), 0);
 
     int run_rc = -2; /* sentinel: thread didn't run */
     pthread_t server_th;

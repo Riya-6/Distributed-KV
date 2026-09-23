@@ -8,7 +8,9 @@
  */
 
 #include <pthread.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "kv/net.h"
@@ -16,6 +18,8 @@
 #include "kv/store.h"
 #include "test_framework.h"
 #include "helpers/test_client.h"
+
+#define TEST_DATA_DIR "build/p2_stage03_data"
 
 /* AB 82 00 00 00 00 00 -- OK */
 static const uint8_t OK_FRAME[] = {0xAB, 0x82, 0x00, 0x00, 0x00, 0x00, 0x00};
@@ -57,7 +61,16 @@ static void *serve_one_client(void *arg) {
 }
 
 static void with_server(void (*scenario)(int client_fd)) {
-    kv_store_destroy(); /* clean slate -- store is process-global/shared */
+    /* Clean slate -- store is process-global/shared across scenarios.
+     * Phase 3, Stage 5: the store persists to disk now, so "clean
+     * slate" means wiping the data directory and reopening, not just
+     * destroy() (which would leave the store unopened and every
+     * kv_store_*() call from server.c's dispatch would crash on a NULL
+     * memtable/WAL). See docs/stages/phase3-lsm-tree.md, Stage 5. */
+    kv_store_destroy();
+    system("rm -rf " TEST_DATA_DIR);
+    mkdir(TEST_DATA_DIR, 0755);
+    KV_ASSERT_EQ_INT(kv_store_open(TEST_DATA_DIR), 0);
 
     int listen_fd = net_listen(0, 1);
     KV_ASSERT(listen_fd >= 0);

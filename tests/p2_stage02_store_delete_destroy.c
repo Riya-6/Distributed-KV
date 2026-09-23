@@ -5,10 +5,27 @@
  * See docs/stages/phase2-storage.md, Stage 2.
  */
 
+#include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 
 #include "kv/store.h"
 #include "test_framework.h"
+
+#define TEST_DATA_DIR "build/p2_stage02_data"
+
+/* Phase 3, Stage 5: see the matching helper in
+ * tests/p2_stage01_store_set_get.c for why this wipes+reopens rather
+ * than relying on the old "no init needed" contract. */
+static void reset_and_open(void) {
+    kv_store_destroy();
+    system("rm -rf " TEST_DATA_DIR);
+    mkdir(TEST_DATA_DIR, 0755);
+    if (kv_store_open(TEST_DATA_DIR) != 0) {
+        fprintf(stderr, "kv_store_open failed\n");
+        exit(1);
+    }
+}
 
 static void test_delete_existing_key(void) {
     KV_ASSERT_EQ_INT(
@@ -50,8 +67,14 @@ static void test_destroy_after_mixed_operations_leaves_it_reusable(void) {
 
     kv_store_destroy();
 
-    /* The store must be usable again immediately -- this is a reset,
-     * not a one-way teardown. */
+    /* Phase 3, Stage 5: destroy() no longer leaves the store
+     * immediately reusable on its own -- it now also closes the WAL
+     * and every open SSTable (see store.h's doc comment), so it has to
+     * be reopened before use, same as at process start. Wipe the
+     * directory too, so "usable again" means "reset to empty," not
+     * "recovers what was just destroyed" via WAL replay. */
+    reset_and_open();
+
     uint8_t *value = NULL;
     uint32_t value_len = 0;
     KV_ASSERT_EQ_INT(kv_store_get((const uint8_t *)"a", 1, &value, &value_len),
@@ -73,9 +96,14 @@ static void test_destroy_on_already_empty_store_is_safe(void) {
 }
 
 int main(void) {
+    reset_and_open();
     KV_RUN(test_delete_existing_key);
+    reset_and_open();
     KV_RUN(test_delete_missing_key_is_a_harmless_no_op);
+    reset_and_open();
     KV_RUN(test_destroy_after_mixed_operations_leaves_it_reusable);
+    reset_and_open();
     KV_RUN(test_destroy_on_already_empty_store_is_safe);
+    kv_store_destroy();
     KV_REPORT_AND_EXIT();
 }

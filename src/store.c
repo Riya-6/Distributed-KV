@@ -1,212 +1,473 @@
+#define _POSIX_C_SOURCE 200809L /* strdup */
+
 #include "kv/store.h"
 
+#include <dirent.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-// One entry stores one key-value pair.
-typedef struct {
-    uint8_t *key;
-    uint16_t key_len;
-    uint8_t *value;
-    uint32_t value_len;
-} entry_t;
+#include "kv/memtable.h"
+#include "kv/sstable.h"
+#include "kv/wal.h"
 
-// Mutex protects the shared store.
+// Flush the memtable 
+#define FLUSH_THRESHOLD 8
+
+#define WAL_FILENAME "wal.log"
+#define SSTABLE_PREFIX "sstable_"
+
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Dynamic array of entries.
-static entry_t *g_entries = NULL;
+// Directory where the WAL and SSTables are stored. 
+static char g_data_dir[512];
 
-// Number of entries currently stored.
-static size_t g_count = 0;
+static kv_memtable_t *g_memtable = NULL;
 
-// Current size of the allocated array.
-static size_t g_capacity = 0;
+static kv_wal_t *g_wal = NULL;
 
-// Find a key while the mutex is already locked.
-static entry_t *find_entry_locked(const uint8_t *key, uint16_t key_len) {
-    for (size_t i = 0; i < g_count; i++) {
+static kv_sstable_t **g_sstables = NULL;
+static size_t g_sstable_count = 0;
 
-        if (g_entries[i].key_len == key_len &&
-            memcmp(g_entries[i].key, key, key_len) == 0) {
-            return &g_entries[i];
-        }
-    }
+// Index used when creating new SSTable files. 
+static int g_next_sstable_index = 0;
 
-    return NULL;
+// Replay a SET record into the memtable. 
+static void replay_set_cb(const uint8_t *key, uint16_t key_len,
+                          const uint8_t *value, uint32_t value_len,
+                          void *ctx) {
+    kv_memtable_put(
+        (kv_memtable_t *)ctx,
+        key,
+        key_len,
+        value,
+        value_len
+    );
 }
 
-int kv_store_set(const uint8_t *key, uint16_t key_len, const uint8_t *value,
-                  uint32_t value_len) {
+// Replay a DELETE record into the memtable.
+static void replay_delete_cb(const uint8_t *key, uint16_t key_len,
+                             void *ctx) {
+    kv_memtable_delete(
+        (kv_memtable_t *)ctx,
+        key,
+        key_len
+    );
+}
 
-    // Allocate memory for a copy of the value.
-    uint8_t *value_copy = malloc(value_len ? value_len : 1);
+// Compare two filenames for sorting. 
+static int cmp_str(const void *a, const void *b) {
+    return strcmp(
+        *(const char *const *)a,
+        *(const char *const *)b
+    );
+}
 
-    if (value_copy == NULL) return -1;
+int kv_store_open(const char *data_dir) {
 
-    // Copy the value into store-owned memory.
-    memcpy(value_copy, value, value_len);
+    // Save the data directory path. 
+    strncpy(
+        g_data_dir,
+        data_dir,
+        sizeof(g_data_dir) - 1
+    );
 
-    // Lock the store before accessing shared data.
-    pthread_mutex_lock(&g_mutex);
+    g_data_dir[sizeof(g_data_dir) - 1] = '\0';
 
-    // Check whether the key already exists.
-    entry_t *existing = find_entry_locked(key, key_len);
+    // Create an empty memtable.
+    g_memtable = kv_memtable_create();
 
-    // Replace the value if the key already exists.
-    if (existing != NULL) {
-        free(existing->value);
-        existing->value = value_copy;
-        existing->value_len = value_len;
-
-        // Unlock the store.
-        pthread_mutex_unlock(&g_mutex);
-
-        // SET was successful.
-        return 0;
-    }
-
-    // Grow the array if it is full.
-    if (g_count == g_capacity) {
-
-        // Start with 4 entries, then double the capacity.
-        size_t new_capacity = g_capacity ? g_capacity * 2 : 4;
-
-        // Allocate a larger array.
-        entry_t *grown = realloc(
-            g_entries,
-            new_capacity * sizeof(entry_t)
-        );
-
-        if (grown == NULL) {
-            free(value_copy);
-            pthread_mutex_unlock(&g_mutex);
-            return -1;
-        }
-
-        g_entries = grown;
-        g_capacity = new_capacity;
-    }
-
-    uint8_t *key_copy = malloc(key_len ? key_len : 1);
-
-    if (key_copy == NULL) {
-        free(value_copy);
-        pthread_mutex_unlock(&g_mutex);
+    if (g_memtable == NULL) {
         return -1;
     }
 
-    // Copy the key into store-owned memory.
-    memcpy(key_copy, key, key_len);
+    // Build the WAL file path.
+    char wal_path[600];
 
-    // Store the new key and value.
-    g_entries[g_count].key = key_copy;
-    g_entries[g_count].key_len = key_len;
-    g_entries[g_count].value = value_copy;
-    g_entries[g_count].value_len = value_len;
+    snprintf(
+        wal_path,
+        sizeof(wal_path),
+        "%s/%s",
+        data_dir,
+        WAL_FILENAME
+    );
 
-    // Increase the number of stored entries.
-    g_count++;
+    /*
+     * Replay the WAL before opening it for new writes.
+     * This restores data that was not flushed to an SSTable.
+     */
+    if (kv_wal_replay(
+            wal_path,
+            replay_set_cb,
+            replay_delete_cb,
+            g_memtable) != 0) {
 
-    // Unlock the store.
-    pthread_mutex_unlock(&g_mutex);
+        kv_memtable_destroy(g_memtable);
+        g_memtable = NULL;
 
-    // SET was successful.
+        return -1;
+    }
+
+    // Open the WAL so new writes can be appended. 
+    g_wal = kv_wal_open(wal_path);
+
+    if (g_wal == NULL) {
+        kv_memtable_destroy(g_memtable);
+        g_memtable = NULL;
+
+        return -1;
+    }
+
+    // Store the names of existing SSTable files.
+    char **names = NULL;
+    size_t names_count = 0;
+    size_t names_cap = 0;
+
+    // Open the data directory.
+    DIR *d = opendir(data_dir);
+
+    if (d != NULL) {
+        struct dirent *entry;
+
+        // Look through every file in the directory.
+        while ((entry = readdir(d)) != NULL) {
+
+            // Ignore files that are not SSTables.
+            if (strncmp(
+                    entry->d_name,
+                    SSTABLE_PREFIX,
+                    strlen(SSTABLE_PREFIX)) != 0) {
+                continue;
+            }
+
+            // Grow the filename array if needed.
+            if (names_count == names_cap) {
+                names_cap = names_cap ? names_cap * 2 : 4;
+
+                names = realloc(
+                    names,
+                    names_cap * sizeof(char *)
+                );
+            }
+
+            // Save the SSTable filename.
+            names[names_count++] = strdup(entry->d_name);
+        }
+
+        closedir(d);
+    }
+
+    // Sort SSTables from oldest to newest.
+    qsort(
+        names,
+        names_count,
+        sizeof(char *),
+        cmp_str
+    );
+
+    // Allocate the SSTable pointer array.
+    g_sstables = names_count
+        ? malloc(names_count * sizeof(kv_sstable_t *))
+        : NULL;
+
+    g_sstable_count = 0;
+
+    // Open every existing SSTable.
+    for (size_t i = 0; i < names_count; i++) {
+
+        char path[700];
+
+        snprintf(
+            path,
+            sizeof(path),
+            "%s/%s",
+            data_dir,
+            names[i]
+        );
+
+        kv_sstable_t *sst = kv_sstable_open(path);
+
+        if (sst != NULL) {
+            g_sstables[g_sstable_count++] = sst;
+        }
+
+        free(names[i]);
+    }
+
+    free(names);
+
+    // Continue numbering after the existing SSTables. 
+    g_next_sstable_index = (int)g_sstable_count;
+
     return 0;
 }
 
-int kv_store_get(const uint8_t *key, uint16_t key_len, uint8_t **out_value,
-                  uint32_t *out_value_len) {
+/*
+ * Write the current memtable to an SSTable.
+ * Caller must already hold g_mutex.
+ */
+static void flush_memtable_locked(void) {
 
-    // Lock the store before searching.
+    // Create the next SSTable filename.
+    char path[700];
+
+    snprintf(
+        path,
+        sizeof(path),
+        "%s/%s%04d.sst",
+        g_data_dir,
+        SSTABLE_PREFIX,
+        g_next_sstable_index++
+    );
+
+    // Write the current memtable to disk.
+    kv_sstable_write(path, g_memtable);
+
+    // Open the newly created SSTable.
+    kv_sstable_t *sst = kv_sstable_open(path);
+
+    // Grow the SSTable array.
+    kv_sstable_t **grown =
+        realloc(
+            g_sstables,
+            (g_sstable_count + 1) * sizeof(kv_sstable_t *)
+        );
+
+    g_sstables = grown;
+
+    // Add the new SSTable at the end.
+    g_sstables[g_sstable_count++] = sst;
+
+    // Replace the old memtable with an empty one.
+    kv_memtable_destroy(g_memtable);
+    g_memtable = kv_memtable_create();
+
+    // The SSTable now contains everything from the WAL.
+    kv_wal_truncate(g_wal);
+}
+
+int kv_store_set(
+    const uint8_t *key,
+    uint16_t key_len,
+    const uint8_t *value,
+    uint32_t value_len
+) {
+    // Lock the store before modifying it.
     pthread_mutex_lock(&g_mutex);
 
-    // Find the requested key.
-    entry_t *existing = find_entry_locked(key, key_len);
+    /*
+     * Write to the WAL first.
+     * This makes the write durable before updating memory.
+     */
+    if (kv_wal_append_set(
+            g_wal,
+            key,
+            key_len,
+            value,
+            value_len) != 0) {
 
-    if (existing == NULL) {
-        pthread_mutex_unlock(&g_mutex);
-        return 0;
-    }
-
-    uint8_t *copy = malloc(existing->value_len ? existing->value_len : 1);
-
-    if (copy == NULL) {
         pthread_mutex_unlock(&g_mutex);
         return -1;
     }
 
-    // Copy the stored value.
-    memcpy(copy, existing->value, existing->value_len);
+    // Add the key-value pair to the memtable.
+    int rc = kv_memtable_put(
+        g_memtable,
+        key,
+        key_len,
+        value,
+        value_len
+    );
 
-    // Save the value length before unlocking.
-    uint32_t copy_len = existing->value_len;
+    // Flush when the memtable becomes large enough.
+    if (rc == 0 &&
+        kv_memtable_count(g_memtable) >= FLUSH_THRESHOLD) {
 
-    // Unlock the store.
+        flush_memtable_locked();
+    }
+
     pthread_mutex_unlock(&g_mutex);
 
-    // Give the copied value to the caller.
-    *out_value = copy;
-    *out_value_len = copy_len;
+    return rc;
+}
+
+int kv_store_get(
+    const uint8_t *key,
+    uint16_t key_len,
+    uint8_t **out_value,
+    uint32_t *out_value_len
+) {
+    // Lock while reading the store.
+    pthread_mutex_lock(&g_mutex);
+
+    // Search the memtable first because it has the newest data.
+     
+    kv_lookup_result_t r =
+        kv_memtable_get(
+            g_memtable,
+            key,
+            key_len,
+            out_value,
+            out_value_len
+        );
+
+    // Key was found in the memtable.
+    if (r == KV_LOOKUP_HIT) {
+        pthread_mutex_unlock(&g_mutex);
+        return 1;
+    }
+
+    // A tombstone means the key was deleted.
+    if (r == KV_LOOKUP_TOMBSTONE) {
+        pthread_mutex_unlock(&g_mutex);
+        return 0;
+    }
+
+    // Search SSTables from newest to oldest.
+     
+    for (size_t i = g_sstable_count; i-- > 0;) {
+
+        kv_lookup_result_t sr =
+            kv_sstable_get(
+                g_sstables[i],
+                key,
+                key_len,
+                out_value,
+                out_value_len
+            );
+
+        // Found the newest available value.
+        if (sr == KV_LOOKUP_HIT) {
+            pthread_mutex_unlock(&g_mutex);
+            return 1;
+        }
+
+        // A tombstone hides older values.
+        if (sr == KV_LOOKUP_TOMBSTONE) {
+            pthread_mutex_unlock(&g_mutex);
+            return 0;
+        }
+    }
+
+    // Key was not found anywhere.
+    pthread_mutex_unlock(&g_mutex);
+
+    return 0;
+}
+
+int kv_store_delete(
+    const uint8_t *key,
+    uint16_t key_len
+) {
+    // Lock the store before modifying it.
+    pthread_mutex_lock(&g_mutex);
+
+    
+    uint8_t *tmp_val = NULL;
+    uint32_t tmp_len = 0;
+    int exists = 0;
+
+    // Check the memtable first.
+    kv_lookup_result_t r =
+        kv_memtable_get(
+            g_memtable,
+            key,
+            key_len,
+            &tmp_val,
+            &tmp_len
+        );
+
+    // Key exists in the memtable.
+    if (r == KV_LOOKUP_HIT) {
+        exists = 1;
+        free(tmp_val);
+
+    // If not found, check the SSTables.
+    } else if (r == KV_LOOKUP_MISS) {
+
+        // Search newest SSTable first.
+        for (size_t i = g_sstable_count; i-- > 0;) {
+
+            kv_lookup_result_t sr =
+                kv_sstable_get(
+                    g_sstables[i],
+                    key,
+                    key_len,
+                    &tmp_val,
+                    &tmp_len
+                );
+
+            // Key exists in an SSTable.
+            if (sr == KV_LOOKUP_HIT) {
+                exists = 1;
+                free(tmp_val);
+                break;
+            }
+
+            /*
+             * A tombstone means the key was already deleted,
+             * so older SSTables should not be checked.
+             */
+            if (sr == KV_LOOKUP_TOMBSTONE) {
+                break;
+            }
+        }
+    }
+
+    if (!exists) {
+        pthread_mutex_unlock(&g_mutex);
+        return 0;
+    }
+
+    // Record the deletion in the WAL first.
+     
+    kv_wal_append_delete(
+        g_wal,
+        key,
+        key_len
+    );
+
+    // Add a tombstone to the memtable.
+    kv_memtable_delete(
+        g_memtable,
+        key,
+        key_len
+    );
+
+    // Flush if the memtable reached the threshold.
+    if (kv_memtable_count(g_memtable) >= FLUSH_THRESHOLD) {
+        flush_memtable_locked();
+    }
+
+    pthread_mutex_unlock(&g_mutex);
 
     return 1;
 }
 
-int kv_store_delete(const uint8_t *key, uint16_t key_len) {
-
-    // Lock the store before modifying it.
-    pthread_mutex_lock(&g_mutex);
-
-    // Search through all stored entries.
-    for (size_t i = 0; i < g_count; i++) {
-
-        if (g_entries[i].key_len == key_len &&
-            memcmp(g_entries[i].key, key, key_len) == 0) {
-
-            // Free the key memory.
-            free(g_entries[i].key);
-
-            // Free the value memory.
-            free(g_entries[i].value);
-
-            // Move the last entry into the deleted entry's position.
-            g_entries[i] = g_entries[g_count - 1];
-
-            // Decrease the number of entries.
-            g_count--;
-
-            // Unlock the store.
-            pthread_mutex_unlock(&g_mutex);
-
-            return 1;
-        }
-    }
-
-    pthread_mutex_unlock(&g_mutex);
-
-    return 0;
-}
-
 void kv_store_destroy(void) {
 
-    // Lock the store before destroying it.
+    // Lock before destroying shared state.
     pthread_mutex_lock(&g_mutex);
 
-    // Free every stored key and value.
-    for (size_t i = 0; i < g_count; i++) {
-        free(g_entries[i].key);
-        free(g_entries[i].value);
+    // Free the current memtable.
+    kv_memtable_destroy(g_memtable);
+    g_memtable = NULL;
+
+    // Close the WAL.
+    kv_wal_close(g_wal);
+    g_wal = NULL;
+
+    // Close every SSTable.
+    for (size_t i = 0; i < g_sstable_count; i++) {
+        kv_sstable_close(g_sstables[i]);
     }
 
-    // Free the entries array.
-    free(g_entries);
+    // Free the SSTable pointer array.
+    free(g_sstables);
 
-    // Reset the store.
-    g_entries = NULL;
-    g_count = 0;
-    g_capacity = 0;
+    g_sstables = NULL;
+    g_sstable_count = 0;
 
-    // Unlock the store.
     pthread_mutex_unlock(&g_mutex);
 }
