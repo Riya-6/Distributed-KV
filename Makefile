@@ -8,13 +8,16 @@ LDFLAGS := -pthread
 
 VALGRIND      := valgrind
 VALGRIND_OPTS := --leak-check=full --show-leak-kinds=all --error-exitcode=1 --quiet
+HELGRIND_OPTS := --tool=helgrind --error-exitcode=1 --quiet
 
 BUILD := build
 
 .PHONY: all clean test-p1 valgrind-p1 test-p2 valgrind-p2 test-p3 valgrind-p3 \
+        test-p4 valgrind-p4 helgrind-p4-s2 \
         test-p1-s1 test-p1-s2 test-p1-s3 test-p1-s4 test-p1-s5 \
         test-p2-s1 test-p2-s2 test-p2-s3 \
-        test-p3-s1 test-p3-s2 test-p3-s3 test-p3-s4 test-p3-s5 test-p3-s6
+        test-p3-s1 test-p3-s2 test-p3-s3 test-p3-s4 test-p3-s5 test-p3-s6 \
+        test-p4-s1 test-p4-s2 test-p4-s3
 
 all: test-p1
 
@@ -184,8 +187,55 @@ valgrind-p3: $(P3_BINS)
 	done; \
 	exit $$status
 
+# --- Phase 4 ---------------------------------------------------------------
+# See docs/stages/phase4-concurrency.md.
+
+$(BUILD)/p4_stage01: tests/p4_stage01_concurrent_accept.c src/net.c src/protocol.c src/command.c src/server.c src/store.c src/memtable.c src/wal.c src/sstable.c tests/helpers/test_client.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(BUILD)/p4_stage02: tests/p4_stage02_store_races.c src/store.c src/memtable.c src/wal.c src/sstable.c src/protocol.c src/command.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(BUILD)/p4_stage03: tests/p4_stage03_compaction_race.c src/sstable.c src/memtable.c src/protocol.c src/command.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+P4_BINS := $(BUILD)/p4_stage01 $(BUILD)/p4_stage02 $(BUILD)/p4_stage03
+
+test-p4-s1: $(BUILD)/p4_stage01
+	./$(BUILD)/p4_stage01
+
+test-p4-s2: $(BUILD)/p4_stage02
+	./$(BUILD)/p4_stage02
+
+test-p4-s3: $(BUILD)/p4_stage03
+	./$(BUILD)/p4_stage03
+
+test-p4: $(P4_BINS)
+	@status=0; \
+	for bin in $(P4_BINS); do \
+		echo "== $$bin =="; \
+		./$$bin || status=1; \
+	done; \
+	exit $$status
+
+valgrind-p4: $(P4_BINS)
+	@status=0; \
+	for bin in $(P4_BINS); do \
+		echo "== valgrind $$bin =="; \
+		$(VALGRIND) $(VALGRIND_OPTS) ./$$bin || status=1; \
+	done; \
+	exit $$status
+
+# Race detection, not leak detection -- see docs/stages/
+# phase4-concurrency.md, Stage 2, for why this is the check that
+# actually matters there. helgrind is far slower than memcheck and has
+# its own false-positive profile, so it's a separate opt-in target
+# rather than folded into valgrind-p4.
+helgrind-p4-s2: $(BUILD)/p4_stage02
+	$(VALGRIND) $(HELGRIND_OPTS) ./$(BUILD)/p4_stage02
+
 # ---------------------------------------------------------------------------
-# Later phases (Phase 4 onward) add their own src/test groups and
+# Later phases (Phase 5 onward) add their own src/test groups and
 # test-pN / valgrind-pN targets here, following the same pattern.
 
 clean:

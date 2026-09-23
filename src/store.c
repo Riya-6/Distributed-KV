@@ -18,7 +18,8 @@
 #define WAL_FILENAME "wal.log"
 #define SSTABLE_PREFIX "sstable_"
 
-static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static pthread_rwlock_t g_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 // Directory where the WAL and SSTables are stored. 
 static char g_data_dir[512];
@@ -93,10 +94,8 @@ int kv_store_open(const char *data_dir) {
         WAL_FILENAME
     );
 
-    /*
-     * Replay the WAL before opening it for new writes.
-     * This restores data that was not flushed to an SSTable.
-     */
+    // Replay WAL before opening it for new writes, restores data that was not flushed to SSTable.
+    
     if (kv_wal_replay(
             wal_path,
             replay_set_cb,
@@ -205,7 +204,7 @@ int kv_store_open(const char *data_dir) {
 
 /*
  * Write the current memtable to an SSTable.
- * Caller must already hold g_mutex.
+ * Caller must already hold the write lock (g_lock).
  */
 static void flush_memtable_locked(void) {
 
@@ -254,12 +253,10 @@ int kv_store_set(
     uint32_t value_len
 ) {
     // Lock the store before modifying it.
-    pthread_mutex_lock(&g_mutex);
+    pthread_rwlock_wrlock(&g_lock);
 
-    /*
-     * Write to the WAL first.
-     * This makes the write durable before updating memory.
-     */
+    // Write to the WAL first. This makes the write durable before updating memory.
+     
     if (kv_wal_append_set(
             g_wal,
             key,
@@ -267,7 +264,7 @@ int kv_store_set(
             value,
             value_len) != 0) {
 
-        pthread_mutex_unlock(&g_mutex);
+        pthread_rwlock_unlock(&g_lock);
         return -1;
     }
 
@@ -287,7 +284,7 @@ int kv_store_set(
         flush_memtable_locked();
     }
 
-    pthread_mutex_unlock(&g_mutex);
+    pthread_rwlock_unlock(&g_lock);
 
     return rc;
 }
@@ -298,11 +295,11 @@ int kv_store_get(
     uint8_t **out_value,
     uint32_t *out_value_len
 ) {
-    // Lock while reading the store.
-    pthread_mutex_lock(&g_mutex);
+    // Shared read lock -- concurrent GETs no longer block each other.
+    pthread_rwlock_rdlock(&g_lock);
 
     // Search the memtable first because it has the newest data.
-     
+
     kv_lookup_result_t r =
         kv_memtable_get(
             g_memtable,
@@ -314,18 +311,18 @@ int kv_store_get(
 
     // Key was found in the memtable.
     if (r == KV_LOOKUP_HIT) {
-        pthread_mutex_unlock(&g_mutex);
+        pthread_rwlock_unlock(&g_lock);
         return 1;
     }
 
     // A tombstone means the key was deleted.
     if (r == KV_LOOKUP_TOMBSTONE) {
-        pthread_mutex_unlock(&g_mutex);
+        pthread_rwlock_unlock(&g_lock);
         return 0;
     }
 
     // Search SSTables from newest to oldest.
-     
+
     for (size_t i = g_sstable_count; i-- > 0;) {
 
         kv_lookup_result_t sr =
@@ -339,19 +336,19 @@ int kv_store_get(
 
         // Found the newest available value.
         if (sr == KV_LOOKUP_HIT) {
-            pthread_mutex_unlock(&g_mutex);
+            pthread_rwlock_unlock(&g_lock);
             return 1;
         }
 
         // A tombstone hides older values.
         if (sr == KV_LOOKUP_TOMBSTONE) {
-            pthread_mutex_unlock(&g_mutex);
+            pthread_rwlock_unlock(&g_lock);
             return 0;
         }
     }
 
     // Key was not found anywhere.
-    pthread_mutex_unlock(&g_mutex);
+    pthread_rwlock_unlock(&g_lock);
 
     return 0;
 }
@@ -361,9 +358,9 @@ int kv_store_delete(
     uint16_t key_len
 ) {
     // Lock the store before modifying it.
-    pthread_mutex_lock(&g_mutex);
+    pthread_rwlock_wrlock(&g_lock);
 
-    
+
     uint8_t *tmp_val = NULL;
     uint32_t tmp_len = 0;
     int exists = 0;
@@ -405,10 +402,8 @@ int kv_store_delete(
                 break;
             }
 
-            /*
-             * A tombstone means the key was already deleted,
-             * so older SSTables should not be checked.
-             */
+            // A tombstone means the key was already deleted, so older SSTables should not be checked.
+             
             if (sr == KV_LOOKUP_TOMBSTONE) {
                 break;
             }
@@ -416,7 +411,7 @@ int kv_store_delete(
     }
 
     if (!exists) {
-        pthread_mutex_unlock(&g_mutex);
+        pthread_rwlock_unlock(&g_lock);
         return 0;
     }
 
@@ -440,7 +435,7 @@ int kv_store_delete(
         flush_memtable_locked();
     }
 
-    pthread_mutex_unlock(&g_mutex);
+    pthread_rwlock_unlock(&g_lock);
 
     return 1;
 }
@@ -448,7 +443,7 @@ int kv_store_delete(
 void kv_store_destroy(void) {
 
     // Lock before destroying shared state.
-    pthread_mutex_lock(&g_mutex);
+    pthread_rwlock_wrlock(&g_lock);
 
     // Free the current memtable.
     kv_memtable_destroy(g_memtable);
@@ -469,5 +464,5 @@ void kv_store_destroy(void) {
     g_sstables = NULL;
     g_sstable_count = 0;
 
-    pthread_mutex_unlock(&g_mutex);
+    pthread_rwlock_unlock(&g_lock);
 }

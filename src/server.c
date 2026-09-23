@@ -1,12 +1,19 @@
+/* Exposes usleep() from <unistd.h> under -std=c11 -- see Phase 1's
+ * stage 4/5 test files for why. Must precede all includes. */
+#define _DEFAULT_SOURCE
+
 #include "kv/server.h"
 
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdatomic.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include "kv/command.h"
 #include "kv/net.h"
@@ -15,7 +22,7 @@
 
 #define KV_CONN_BUF_CAP (KV_HEADER_LEN + KV_MAX_PAYLOAD_LEN)
 
-/* Send all bytes in the buffer. */
+// Send all bytes in the buffer. 
 static int send_all(int fd, const uint8_t *buf, size_t len) {
     size_t sent = 0;
 
@@ -34,7 +41,7 @@ static int send_all(int fd, const uint8_t *buf, size_t len) {
     return 0;
 }
 
-/* Execute the command and decide what response to send. */
+// Execute the command and decide what response to send. 
 static void dispatch(const kv_command_t *cmd, uint8_t *resp_opcode,
                       uint8_t **owned_payload, uint32_t *owned_payload_len) {
     *owned_payload = NULL;
@@ -230,13 +237,38 @@ done:
     return result;
 }
 
-/* Shared server state protected by the mutex. */
+/*
+ * Phase 4, Stage 1: one detached thread per client connection.
+ * The client fd is passed directly as the thread argument.
+ */
+
+static atomic_int g_active_clients = 0;
+
+static void *client_thread(void *arg) {
+    int client_fd = (int)(intptr_t)arg;
+
+    // Mark this client as active.
+    atomic_fetch_add(&g_active_clients, 1);
+
+    // Handle this client.
+    kv_handle_client(client_fd);
+
+    // Close the client connection.
+    net_close(client_fd);
+
+    // Mark this client as finished.
+    atomic_fetch_sub(&g_active_clients, 1);
+
+    return NULL;
+}
+
+// Shared server state protected by the mutex.
 static pthread_mutex_t g_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_listen_fd = -1;
 static uint16_t g_port = 0;
 static int g_stop_requested = 0;
 
-// How often the server checks for a stop request.
+// How often the server checks for shutdown.
 #define KV_ACCEPT_POLL_MS 100
 
 int kv_run_server(uint16_t port) {
@@ -246,7 +278,7 @@ int kv_run_server(uint16_t port) {
         return -1;
     }
 
-    // Set a timeout so the accept loop can check the stop flag.
+    // Set a timeout so the loop can check the stop flag.
     struct timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = KV_ACCEPT_POLL_MS * 1000;
@@ -259,7 +291,7 @@ int kv_run_server(uint16_t port) {
         sizeof(tv)
     );
 
-    // Find the actual port used by the socket.
+    // Get the actual port used by the socket.
     struct sockaddr_in bound_addr;
     socklen_t bound_len = sizeof(bound_addr);
     uint16_t bound_port = 0;
@@ -281,7 +313,7 @@ int kv_run_server(uint16_t port) {
 
     pthread_mutex_unlock(&g_state_mutex);
 
-    // Keep accepting clients until the server is stopped.
+    // Keep accepting clients until shutdown is requested.
     for (;;) {
         pthread_mutex_lock(&g_state_mutex);
         int stop = g_stop_requested;
@@ -291,19 +323,42 @@ int kv_run_server(uint16_t port) {
             break;
         }
 
+        // Accept a new client.
         int client_fd = net_accept(listen_fd, NULL);
 
         if (client_fd < 0) {
             continue;
         }
 
-        // Handle the connected client.
-        kv_handle_client(client_fd);
+        // Create a thread to handle the client.
+        pthread_t client_th;
 
-        net_close(client_fd);
+        if (pthread_create(
+                &client_th,
+                NULL,
+                client_thread,
+                (void *)(intptr_t)client_fd
+            ) != 0) {
+
+            // Handle the client directly if thread creation fails.
+            kv_handle_client(client_fd);
+            net_close(client_fd);
+            continue;
+        }
+
+        // No need to join a detached thread.
+        pthread_detach(client_th);
     }
 
-    // Close the listening socket and reset server state.
+    // Wait for active clients to finish before destroying the store.
+    for (int waited_ms = 0;
+         atomic_load(&g_active_clients) > 0 && waited_ms < 3000;
+         waited_ms += 20) {
+
+        usleep(20 * 1000);
+    }
+
+    // Close the listening socket and reset the server state.
     pthread_mutex_lock(&g_state_mutex);
 
     net_close(g_listen_fd);
@@ -312,7 +367,7 @@ int kv_run_server(uint16_t port) {
 
     pthread_mutex_unlock(&g_state_mutex);
 
-    // Free all memory owned by the KV store.
+    // Destroy the KV store after clients have finished.
     kv_store_destroy();
 
     return 0;
@@ -321,6 +376,7 @@ int kv_run_server(uint16_t port) {
 void kv_stop_server(void) {
     pthread_mutex_lock(&g_state_mutex);
 
+    // Request the server to stop accepting clients.
     g_stop_requested = 1;
 
     pthread_mutex_unlock(&g_state_mutex);
@@ -329,6 +385,7 @@ void kv_stop_server(void) {
 uint16_t kv_server_port(void) {
     pthread_mutex_lock(&g_state_mutex);
 
+    // Read the current server port safely.
     uint16_t port = g_port;
 
     pthread_mutex_unlock(&g_state_mutex);

@@ -22,11 +22,21 @@
  *   }
  */
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 
-static int kv_test_assertions = 0;
-static int kv_test_failures = 0;
+/*
+ * Atomic, not plain int: Phase 4 onward has test files that call
+ * KV_ASSERT from multiple threads concurrently (race-condition tests
+ * against the storage layer). A plain `int` here would itself be a
+ * data race -- lost increments could silently undercount, or even
+ * hide, a real failure. atomic_int's ++ is a well-defined atomic
+ * increment, a drop-in replacement that costs nothing for the many
+ * single-threaded test files that only ever touch it from main().
+ */
+static atomic_int kv_test_assertions = 0;
+static atomic_int kv_test_failures = 0;
 static const char *kv_test_current = "";
 
 #define KV_ASSERT(cond)                                                    \
