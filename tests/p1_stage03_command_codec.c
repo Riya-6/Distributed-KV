@@ -11,7 +11,8 @@
 #include "test_framework.h"
 
 static void test_decode_ping(void) {
-    kv_frame_t frame = {KV_OP_PING, 0, NULL, KV_HEADER_LEN};
+    kv_frame_t frame = {.opcode = KV_OP_PING, .flags = 0, .payload_len = 0,
+                         .payload = NULL, .frame_len = KV_HEADER_LEN};
     kv_command_t cmd;
     int rc = kv_decode_command(&frame, &cmd);
     KV_ASSERT_EQ_INT(rc, 0);
@@ -21,8 +22,9 @@ static void test_decode_ping(void) {
 static void test_decode_get(void) {
     /* key_len=3, "foo" */
     static const uint8_t payload[] = {0x00, 0x03, 'f', 'o', 'o'};
-    kv_frame_t frame = {KV_OP_GET, sizeof(payload), payload,
-                         KV_HEADER_LEN + sizeof(payload)};
+    kv_frame_t frame = {.opcode = KV_OP_GET, .flags = 0,
+                         .payload_len = sizeof(payload), .payload = payload,
+                         .frame_len = KV_HEADER_LEN + sizeof(payload)};
     kv_command_t cmd;
     int rc = kv_decode_command(&frame, &cmd);
     KV_ASSERT_EQ_INT(rc, 0);
@@ -33,8 +35,9 @@ static void test_decode_get(void) {
 
 static void test_decode_delete(void) {
     static const uint8_t payload[] = {0x00, 0x03, 'f', 'o', 'o'};
-    kv_frame_t frame = {KV_OP_DELETE, sizeof(payload), payload,
-                         KV_HEADER_LEN + sizeof(payload)};
+    kv_frame_t frame = {.opcode = KV_OP_DELETE, .flags = 0,
+                         .payload_len = sizeof(payload), .payload = payload,
+                         .frame_len = KV_HEADER_LEN + sizeof(payload)};
     kv_command_t cmd;
     int rc = kv_decode_command(&frame, &cmd);
     KV_ASSERT_EQ_INT(rc, 0);
@@ -46,8 +49,9 @@ static void test_decode_set(void) {
     /* key_len=3 "foo", value_len=3 "bar" */
     static const uint8_t payload[] = {0x00, 0x03, 'f',  'o',  'o',
                                        0x00, 0x00, 0x00, 0x03, 'b', 'a', 'r'};
-    kv_frame_t frame = {KV_OP_SET, sizeof(payload), payload,
-                         KV_HEADER_LEN + sizeof(payload)};
+    kv_frame_t frame = {.opcode = KV_OP_SET, .flags = 0,
+                         .payload_len = sizeof(payload), .payload = payload,
+                         .frame_len = KV_HEADER_LEN + sizeof(payload)};
     kv_command_t cmd;
     int rc = kv_decode_command(&frame, &cmd);
     KV_ASSERT_EQ_INT(rc, 0);
@@ -62,8 +66,9 @@ static void test_decode_set_with_impossible_key_len_fails(void) {
      * long -- must be rejected, not read out of bounds. */
     static const uint8_t payload[] = {0xFF, 0xFF, 'f',  'o',  'o',
                                        0x00, 0x00, 0x00, 0x03, 'b', 'a', 'r'};
-    kv_frame_t frame = {KV_OP_SET, sizeof(payload), payload,
-                         KV_HEADER_LEN + sizeof(payload)};
+    kv_frame_t frame = {.opcode = KV_OP_SET, .flags = 0,
+                         .payload_len = sizeof(payload), .payload = payload,
+                         .frame_len = KV_HEADER_LEN + sizeof(payload)};
     kv_command_t cmd;
     int rc = kv_decode_command(&frame, &cmd);
     KV_ASSERT_EQ_INT(rc, -1);

@@ -12,13 +12,14 @@ typedef enum {
     KV_LOOKUP_TOMBSTONE = 2  // key present but deleted, callers merging across layers must stop searching
 } kv_lookup_result_t;
 
-// A read-only view into one entry, by sorted position 
+// A read-only view into one entry, by sorted position
 typedef struct {
     const uint8_t *key;
     uint16_t key_len;
-    const uint8_t *value;   
-    uint32_t value_len;     
+    const uint8_t *value;
+    uint32_t value_len;
     int is_tombstone;
+    uint32_t expires_at; // 0 = never expires; absolute epoch seconds otherwise
 } kv_entry_view_t;
 
 kv_memtable_t *kv_memtable_create(void);
@@ -29,13 +30,26 @@ void kv_memtable_destroy(kv_memtable_t *mt);
 int kv_memtable_put(kv_memtable_t *mt, const uint8_t *key, uint16_t key_len,
                      const uint8_t *value, uint32_t value_len);
 
-// Mark `key` as deleted (a tombstone), copying the key in if it wasn't already present. 
+// Same as kv_memtable_put(), but also records an absolute expiry
+// timestamp (0 = never expires).
+int kv_memtable_put_ttl(kv_memtable_t *mt, const uint8_t *key, uint16_t key_len,
+                         const uint8_t *value, uint32_t value_len,
+                         uint32_t expires_at);
+
+// Mark `key` as deleted (a tombstone), copying the key in if it wasn't already present.
 int kv_memtable_delete(kv_memtable_t *mt, const uint8_t *key, uint16_t key_len);
 
 
 kv_lookup_result_t kv_memtable_get(const kv_memtable_t *mt, const uint8_t *key,
                                     uint16_t key_len, uint8_t **out_value,
                                     uint32_t *out_value_len);
+
+// Same as kv_memtable_get(), but also reports the entry's absolute
+// expiry timestamp on a HIT (0 = never expires).
+kv_lookup_result_t kv_memtable_get_ttl(const kv_memtable_t *mt, const uint8_t *key,
+                                        uint16_t key_len, uint8_t **out_value,
+                                        uint32_t *out_value_len,
+                                        uint32_t *out_expires_at);
 
 
 size_t kv_memtable_count(const kv_memtable_t *mt);

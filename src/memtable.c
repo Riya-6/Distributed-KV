@@ -11,6 +11,7 @@ typedef struct {
     uint8_t *value;   // NULL if is_tombstone
     uint32_t value_len;
     int is_tombstone;
+    uint32_t expires_at; // 0 = never expires; ignored when is_tombstone
 } mt_entry_t;
 
 struct kv_memtable {
@@ -80,7 +81,8 @@ static int ensure_capacity(kv_memtable_t *mt) {
 
 // Insert a new key or update an existing key.
 static int upsert(kv_memtable_t *mt, const uint8_t *key, uint16_t key_len,
-                   const uint8_t *value, uint32_t value_len, int is_tombstone) {
+                   const uint8_t *value, uint32_t value_len, int is_tombstone,
+                   uint32_t expires_at) {
     int found;
     size_t idx = find_index(mt, key, key_len, &found);
 
@@ -91,12 +93,16 @@ static int upsert(kv_memtable_t *mt, const uint8_t *key, uint16_t key_len,
         memcpy(value_copy, value, value_len);
     }
 
+    // A tombstone carries no expiry of its own.
+    uint32_t stored_expires_at = is_tombstone ? 0 : expires_at;
+
     // Update the existing entry.
     if (found) {
         free(mt->entries[idx].value);
         mt->entries[idx].value = value_copy;
         mt->entries[idx].value_len = is_tombstone ? 0 : value_len;
         mt->entries[idx].is_tombstone = is_tombstone;
+        mt->entries[idx].expires_at = stored_expires_at;
         return 0;
     }
 
@@ -122,6 +128,7 @@ static int upsert(kv_memtable_t *mt, const uint8_t *key, uint16_t key_len,
     mt->entries[idx].value = value_copy;
     mt->entries[idx].value_len = is_tombstone ? 0 : value_len;
     mt->entries[idx].is_tombstone = is_tombstone;
+    mt->entries[idx].expires_at = stored_expires_at;
     mt->count++;
     return 0;
 }
@@ -129,12 +136,19 @@ static int upsert(kv_memtable_t *mt, const uint8_t *key, uint16_t key_len,
 // Insert or update a normal key-value pair.
 int kv_memtable_put(kv_memtable_t *mt, const uint8_t *key, uint16_t key_len,
                      const uint8_t *value, uint32_t value_len) {
-    return upsert(mt, key, key_len, value, value_len, 0);
+    return upsert(mt, key, key_len, value, value_len, 0, 0);
+}
+
+// Insert or update a key-value pair with an absolute expiry.
+int kv_memtable_put_ttl(kv_memtable_t *mt, const uint8_t *key, uint16_t key_len,
+                         const uint8_t *value, uint32_t value_len,
+                         uint32_t expires_at) {
+    return upsert(mt, key, key_len, value, value_len, 0, expires_at);
 }
 
 // Mark a key as deleted using a tombstone.
 int kv_memtable_delete(kv_memtable_t *mt, const uint8_t *key, uint16_t key_len) {
-    return upsert(mt, key, key_len, NULL, 0, 1);
+    return upsert(mt, key, key_len, NULL, 0, 1, 0);
 }
 
 // Look up a key and return its value if it exists.
@@ -162,6 +176,32 @@ kv_lookup_result_t kv_memtable_get(const kv_memtable_t *mt, const uint8_t *key,
     return KV_LOOKUP_HIT;
 }
 
+// Same as kv_memtable_get(), but also reports the entry's expiry.
+kv_lookup_result_t kv_memtable_get_ttl(const kv_memtable_t *mt, const uint8_t *key,
+                                        uint16_t key_len, uint8_t **out_value,
+                                        uint32_t *out_value_len,
+                                        uint32_t *out_expires_at) {
+    int found;
+    size_t idx = find_index(mt, key, key_len, &found);
+
+    if (!found) return KV_LOOKUP_MISS;
+
+    if (mt->entries[idx].is_tombstone) return KV_LOOKUP_TOMBSTONE;
+
+    uint32_t value_len = mt->entries[idx].value_len;
+    uint8_t *copy = malloc(value_len ? value_len : 1);
+
+    if (copy == NULL) return KV_LOOKUP_MISS;
+
+    memcpy(copy, mt->entries[idx].value, value_len);
+
+    *out_value = copy;
+    *out_value_len = value_len;
+    *out_expires_at = mt->entries[idx].expires_at;
+
+    return KV_LOOKUP_HIT;
+}
+
 // Return the number of entries in the memtable.
 size_t kv_memtable_count(const kv_memtable_t *mt) {
     return mt->count;
@@ -179,6 +219,7 @@ int kv_memtable_entry_at(const kv_memtable_t *mt, size_t index,
     out->is_tombstone = e->is_tombstone;
     out->value = e->is_tombstone ? NULL : e->value;
     out->value_len = e->is_tombstone ? 0 : e->value_len;
+    out->expires_at = e->is_tombstone ? 0 : e->expires_at;
 
     return 0;
 }

@@ -103,9 +103,12 @@ int kv_decode_command(const kv_frame_t *frame, kv_command_t *out) {
             read_u32_be(frame->payload + value_len_off);
         size_t value_off = value_len_off + 4;
 
-        // Check that the payload contains exactly the declared number of value bytes.
-         
-        if (value_off + value_len != frame->payload_len) {
+        // A HAS_TTL frame carries 4 more trailing bytes after the value.
+        int has_ttl = (frame->flags & KV_FLAG_HAS_TTL) != 0;
+        size_t expected_len = value_off + value_len + (has_ttl ? 4 : 0);
+
+        // Check that the payload contains exactly the declared bytes.
+        if (expected_len != frame->payload_len) {
             return -1;
         }
 
@@ -114,6 +117,10 @@ int kv_decode_command(const kv_frame_t *frame, kv_command_t *out) {
         out->key_len = key_len;
         out->value = frame->payload + value_off;
         out->value_len = value_len;
+        out->has_ttl = has_ttl;
+        out->ttl_field = has_ttl
+            ? read_u32_be(frame->payload + value_off + value_len)
+            : 0;
 
         return 0;
     }
@@ -125,8 +132,9 @@ int kv_decode_command(const kv_frame_t *frame, kv_command_t *out) {
 // Create a response frame in the output buffer.
 
 
-size_t kv_encode_response(
+size_t kv_encode_frame(
     uint8_t opcode,
+    uint8_t flags,
     const uint8_t *payload,
     uint32_t payload_len,
     uint8_t *out_buf,
@@ -143,7 +151,7 @@ size_t kv_encode_response(
     out_buf[0] = KV_MAGIC;
     out_buf[1] = opcode;
     write_u32_be(out_buf + 2, payload_len);
-    out_buf[6] = 0x00;
+    out_buf[6] = flags;
     if (payload_len > 0) {
         memcpy(
             out_buf + KV_HEADER_LEN,
@@ -154,4 +162,14 @@ size_t kv_encode_response(
 
     // Return the number of bytes in the response frame.
     return total;
+}
+
+size_t kv_encode_response(
+    uint8_t opcode,
+    const uint8_t *payload,
+    uint32_t payload_len,
+    uint8_t *out_buf,
+    size_t out_buf_cap
+) {
+    return kv_encode_frame(opcode, 0x00, payload, payload_len, out_buf, out_buf_cap);
 }

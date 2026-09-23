@@ -14,11 +14,13 @@ BUILD := build
 
 .PHONY: all clean test-p1 valgrind-p1 test-p2 valgrind-p2 test-p3 valgrind-p3 \
         test-p4 valgrind-p4 helgrind-p4-s2 test-p5 valgrind-p5 \
+        test-p6 valgrind-p6 \
         test-p1-s1 test-p1-s2 test-p1-s3 test-p1-s4 test-p1-s5 \
         test-p2-s1 test-p2-s2 test-p2-s3 \
         test-p3-s1 test-p3-s2 test-p3-s3 test-p3-s4 test-p3-s5 test-p3-s6 \
         test-p4-s1 test-p4-s2 test-p4-s3 \
-        test-p5-s1 test-p5-s2
+        test-p5-s1 test-p5-s2 \
+        test-p6-s1 test-p6-s2
 
 all: test-p1
 
@@ -277,8 +279,44 @@ test-p5: $(P5_BINS)
 valgrind-p5: $(BUILD)/kv_server
 	@echo "valgrind-p5 checks $(BUILD)/kv_server manually -- see docs/stages/phase5-persistence.md"
 
+# --- Phase 6 ---------------------------------------------------------------
+# See docs/stages/phase6-ttl.md. Back to the Phase 1-4 shape (link
+# server.c/store.c straight into the test binary) -- TTL's actual
+# behavior lives in the storage layer, so there's no need for these
+# tests to go through a separate process like Phase 5's did.
+
+$(BUILD)/p6_stage01: tests/p6_stage01_lazy_expiry.c src/store.c src/memtable.c src/wal.c src/sstable.c src/protocol.c src/command.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(BUILD)/p6_stage02: tests/p6_stage02_active_sweep.c src/store.c src/memtable.c src/wal.c src/sstable.c src/protocol.c src/command.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+P6_BINS := $(BUILD)/p6_stage01 $(BUILD)/p6_stage02
+
+test-p6-s1: $(BUILD)/p6_stage01
+	./$(BUILD)/p6_stage01
+
+test-p6-s2: $(BUILD)/p6_stage02
+	./$(BUILD)/p6_stage02
+
+test-p6: $(P6_BINS)
+	@status=0; \
+	for bin in $(P6_BINS); do \
+		echo "== $$bin =="; \
+		./$$bin || status=1; \
+	done; \
+	exit $$status
+
+valgrind-p6: $(P6_BINS)
+	@status=0; \
+	for bin in $(P6_BINS); do \
+		echo "== valgrind $$bin =="; \
+		$(VALGRIND) $(VALGRIND_OPTS) ./$$bin || status=1; \
+	done; \
+	exit $$status
+
 # ---------------------------------------------------------------------------
-# Later phases (Phase 6 onward) add their own src/test groups and
+# Later phases (Phase 7 onward) add their own src/test groups and
 # test-pN / valgrind-pN targets here, following the same pattern.
 
 clean:

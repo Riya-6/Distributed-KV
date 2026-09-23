@@ -7,13 +7,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "kv/memtable.h"
 #include "kv/sstable.h"
 #include "kv/wal.h"
 
-// Flush the memtable 
+// Flush the memtable
 #define FLUSH_THRESHOLD 8
+
+//  how often the active sweep thread scans the memtable for expired keys.
+#define SWEEP_INTERVAL_MS 200
 
 #define WAL_FILENAME "wal.log"
 #define SSTABLE_PREFIX "sstable_"
@@ -21,7 +25,7 @@
 
 static pthread_rwlock_t g_lock = PTHREAD_RWLOCK_INITIALIZER;
 
-// Directory where the WAL and SSTables are stored. 
+// Directory where the WAL and SSTables are stored.
 static char g_data_dir[512];
 
 static kv_memtable_t *g_memtable = NULL;
@@ -31,19 +35,28 @@ static kv_wal_t *g_wal = NULL;
 static kv_sstable_t **g_sstables = NULL;
 static size_t g_sstable_count = 0;
 
-// Index used when creating new SSTable files. 
+// Index used when creating new SSTable files.
 static int g_next_sstable_index = 0;
 
-// Replay a SET record into the memtable. 
+// Active sweep thread state.
+static pthread_t g_sweep_thread;
+static int g_sweep_running = 0;
+static pthread_mutex_t g_sweep_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_sweep_cond = PTHREAD_COND_INITIALIZER;
+static int g_sweep_stop = 0;
+static void *sweep_thread_fn(void *arg);
+
+// Replay a SET record into the memtable.
 static void replay_set_cb(const uint8_t *key, uint16_t key_len,
                           const uint8_t *value, uint32_t value_len,
-                          void *ctx) {
-    kv_memtable_put(
+                          uint32_t expires_at, void *ctx) {
+    kv_memtable_put_ttl(
         (kv_memtable_t *)ctx,
         key,
         key_len,
         value,
-        value_len
+        value_len,
+        expires_at
     );
 }
 
@@ -96,7 +109,7 @@ int kv_store_open(const char *data_dir) {
 
     // Replay WAL before opening it for new writes, restores data that was not flushed to SSTable.
     
-    if (kv_wal_replay(
+    if (kv_wal_replay_ttl(
             wal_path,
             replay_set_cb,
             replay_delete_cb,
@@ -196,10 +209,71 @@ int kv_store_open(const char *data_dir) {
 
     free(names);
 
-    // Continue numbering after the existing SSTables. 
+    // Continue numbering after the existing SSTables.
     g_next_sstable_index = (int)g_sstable_count;
 
+    // Start the active sweep thread.
+    g_sweep_stop = 0;
+    g_sweep_running = (pthread_create(&g_sweep_thread, NULL, sweep_thread_fn, NULL) == 0);
+
     return 0;
+}
+
+// One pass over the memtable: any live entry whose expires_at has
+// passed gets shadowed by a fresh tombstone.
+static void sweep_once_locked(void) {
+    uint32_t now = (uint32_t)time(NULL);
+    size_t count = kv_memtable_count(g_memtable);
+
+    for (size_t i = 0; i < count; i++) {
+        kv_entry_view_t view;
+
+        if (kv_memtable_entry_at(g_memtable, i, &view) != 0) {
+            continue;
+        }
+
+        if (view.is_tombstone) {
+            continue;
+        }
+
+        if (view.expires_at != 0 && view.expires_at <= now) {
+            kv_wal_append_delete(g_wal, view.key, view.key_len);
+            kv_memtable_delete(g_memtable, view.key, view.key_len);
+        }
+    }
+}
+
+static void *sweep_thread_fn(void *arg) {
+    (void)arg;
+
+    for (;;) {
+        pthread_mutex_lock(&g_sweep_mutex);
+
+        if (!g_sweep_stop) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += (long)SWEEP_INTERVAL_MS * 1000000L;
+            if (ts.tv_nsec >= 1000000000L) {
+                ts.tv_sec += 1;
+                ts.tv_nsec -= 1000000000L;
+            }
+            // Ignoring the return value: a timeout means "sweep now"
+            pthread_cond_timedwait(&g_sweep_cond, &g_sweep_mutex, &ts);
+        }
+
+        int stop = g_sweep_stop;
+        pthread_mutex_unlock(&g_sweep_mutex);
+
+        if (stop) {
+            break;
+        }
+
+        pthread_rwlock_wrlock(&g_lock);
+        sweep_once_locked();
+        pthread_rwlock_unlock(&g_lock);
+    }
+
+    return NULL;
 }
 
 /*
@@ -246,35 +320,44 @@ static void flush_memtable_locked(void) {
     kv_wal_truncate(g_wal);
 }
 
-int kv_store_set(
+// ttl_seconds == 0 means "never expires". A positive value is
+// converted to an absolute wall-clock expiry here
+int kv_store_set_ttl(
     const uint8_t *key,
     uint16_t key_len,
     const uint8_t *value,
-    uint32_t value_len
+    uint32_t value_len,
+    uint32_t ttl_seconds
 ) {
+    uint32_t expires_at = ttl_seconds > 0
+        ? (uint32_t)time(NULL) + ttl_seconds
+        : 0;
+
     // Lock the store before modifying it.
     pthread_rwlock_wrlock(&g_lock);
 
     // Write to the WAL first. This makes the write durable before updating memory.
-     
-    if (kv_wal_append_set(
+
+    if (kv_wal_append_set_ttl(
             g_wal,
             key,
             key_len,
             value,
-            value_len) != 0) {
+            value_len,
+            expires_at) != 0) {
 
         pthread_rwlock_unlock(&g_lock);
         return -1;
     }
 
     // Add the key-value pair to the memtable.
-    int rc = kv_memtable_put(
+    int rc = kv_memtable_put_ttl(
         g_memtable,
         key,
         key_len,
         value,
-        value_len
+        value_len,
+        expires_at
     );
 
     // Flush when the memtable becomes large enough.
@@ -289,68 +372,110 @@ int kv_store_set(
     return rc;
 }
 
+int kv_store_set(
+    const uint8_t *key,
+    uint16_t key_len,
+    const uint8_t *value,
+    uint32_t value_len
+) {
+    return kv_store_set_ttl(key, key_len, value, value_len, 0);
+}
+
+/*
+ * Looks up key across the memtable then SSTables (newest to oldest).
+ * Returns:
+ *   1 - live HIT; out_value / out_value_len are set, caller owns the copy.
+ *   0 - genuinely not found (miss or tombstone).
+ *   2 - found, but its expires_at is in the past.
+ */
+static int lookup_locked(
+    const uint8_t *key,
+    uint16_t key_len,
+    uint8_t **out_value,
+    uint32_t *out_value_len,
+    int allow_clear
+) {
+    uint32_t now = (uint32_t)time(NULL);
+    uint32_t expires_at = 0;
+
+    kv_lookup_result_t r =
+        kv_memtable_get_ttl(g_memtable, key, key_len, out_value, out_value_len,
+                             &expires_at);
+
+    if (r == KV_LOOKUP_HIT) {
+        if (expires_at != 0 && expires_at <= now) {
+            free(*out_value);
+            *out_value = NULL;
+            if (!allow_clear) {
+                return 2;
+            }
+            kv_wal_append_delete(g_wal, key, key_len);
+            kv_memtable_delete(g_memtable, key, key_len);
+            return 0;
+        }
+        return 1;
+    }
+
+    if (r == KV_LOOKUP_TOMBSTONE) {
+        return 0;
+    }
+
+    // Search SSTables from newest to oldest.
+    for (size_t i = g_sstable_count; i-- > 0;) {
+
+        kv_lookup_result_t sr =
+            kv_sstable_get_ttl(g_sstables[i], key, key_len, out_value,
+                                out_value_len, &expires_at);
+
+        if (sr == KV_LOOKUP_HIT) {
+            if (expires_at != 0 && expires_at <= now) {
+                free(*out_value);
+                *out_value = NULL;
+                if (!allow_clear) {
+                    return 2;
+                }
+                // Shadow the still-physically-present SSTable value
+                // with a fresh memtable tombstone, same mechanism a
+                // real DELETE already uses.
+                kv_wal_append_delete(g_wal, key, key_len);
+                kv_memtable_delete(g_memtable, key, key_len);
+                return 0;
+            }
+            return 1;
+        }
+
+        if (sr == KV_LOOKUP_TOMBSTONE) {
+            return 0;
+        }
+    }
+
+    return 0;
+}
+
 int kv_store_get(
     const uint8_t *key,
     uint16_t key_len,
     uint8_t **out_value,
     uint32_t *out_value_len
 ) {
-    // Shared read lock -- concurrent GETs no longer block each other.
+    // Fast path: shared read lock, no mutation. Covers every case
+    // except "found, but expired"
     pthread_rwlock_rdlock(&g_lock);
-
-    // Search the memtable first because it has the newest data.
-
-    kv_lookup_result_t r =
-        kv_memtable_get(
-            g_memtable,
-            key,
-            key_len,
-            out_value,
-            out_value_len
-        );
-
-    // Key was found in the memtable.
-    if (r == KV_LOOKUP_HIT) {
-        pthread_rwlock_unlock(&g_lock);
-        return 1;
-    }
-
-    // A tombstone means the key was deleted.
-    if (r == KV_LOOKUP_TOMBSTONE) {
-        pthread_rwlock_unlock(&g_lock);
-        return 0;
-    }
-
-    // Search SSTables from newest to oldest.
-
-    for (size_t i = g_sstable_count; i-- > 0;) {
-
-        kv_lookup_result_t sr =
-            kv_sstable_get(
-                g_sstables[i],
-                key,
-                key_len,
-                out_value,
-                out_value_len
-            );
-
-        // Found the newest available value.
-        if (sr == KV_LOOKUP_HIT) {
-            pthread_rwlock_unlock(&g_lock);
-            return 1;
-        }
-
-        // A tombstone hides older values.
-        if (sr == KV_LOOKUP_TOMBSTONE) {
-            pthread_rwlock_unlock(&g_lock);
-            return 0;
-        }
-    }
-
-    // Key was not found anywhere.
+    int rc = lookup_locked(key, key_len, out_value, out_value_len, 0);
     pthread_rwlock_unlock(&g_lock);
 
-    return 0;
+    if (rc != 2) {
+        return rc;
+    }
+
+    // Slow path: an expired-but-still-present entry was seen above.
+    // Re-run the whole lookup under the write lock so it's safe to
+    // clear it
+    pthread_rwlock_wrlock(&g_lock);
+    rc = lookup_locked(key, key_len, out_value, out_value_len, 1);
+    pthread_rwlock_unlock(&g_lock);
+
+    return (rc == 1) ? 1 : 0;
 }
 
 int kv_store_delete(
@@ -363,21 +488,24 @@ int kv_store_delete(
 
     uint8_t *tmp_val = NULL;
     uint32_t tmp_len = 0;
+    uint32_t tmp_expires_at = 0;
+    uint32_t now = (uint32_t)time(NULL);
     int exists = 0;
 
     // Check the memtable first.
     kv_lookup_result_t r =
-        kv_memtable_get(
+        kv_memtable_get_ttl(
             g_memtable,
             key,
             key_len,
             &tmp_val,
-            &tmp_len
+            &tmp_len,
+            &tmp_expires_at
         );
 
-    // Key exists in the memtable.
+    // Key exists in the memtable, and isn't expired.
     if (r == KV_LOOKUP_HIT) {
-        exists = 1;
+        exists = (tmp_expires_at == 0 || tmp_expires_at > now);
         free(tmp_val);
 
     // If not found, check the SSTables.
@@ -387,23 +515,24 @@ int kv_store_delete(
         for (size_t i = g_sstable_count; i-- > 0;) {
 
             kv_lookup_result_t sr =
-                kv_sstable_get(
+                kv_sstable_get_ttl(
                     g_sstables[i],
                     key,
                     key_len,
                     &tmp_val,
-                    &tmp_len
+                    &tmp_len,
+                    &tmp_expires_at
                 );
 
-            // Key exists in an SSTable.
+            // Key exists in an SSTable, and isn't expired.
             if (sr == KV_LOOKUP_HIT) {
-                exists = 1;
+                exists = (tmp_expires_at == 0 || tmp_expires_at > now);
                 free(tmp_val);
                 break;
             }
 
             // A tombstone means the key was already deleted, so older SSTables should not be checked.
-             
+
             if (sr == KV_LOOKUP_TOMBSTONE) {
                 break;
             }
@@ -441,6 +570,18 @@ int kv_store_delete(
 }
 
 void kv_store_destroy(void) {
+
+    // Stop and join the sweep thread first- it must not still be
+    // running when the memtable/WAL/SSTables below are freed.
+    pthread_mutex_lock(&g_sweep_mutex);
+    g_sweep_stop = 1;
+    pthread_cond_signal(&g_sweep_cond);
+    pthread_mutex_unlock(&g_sweep_mutex);
+
+    if (g_sweep_running) {
+        pthread_join(g_sweep_thread, NULL);
+        g_sweep_running = 0;
+    }
 
     // Lock before destroying shared state.
     pthread_rwlock_wrlock(&g_lock);

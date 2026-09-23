@@ -36,12 +36,16 @@ void kv_wal_close(kv_wal_t *wal) {
     free(wal);
 }
 
-// Build a SET or DELETE record and append it to the WAL. 
+// Build a SET or DELETE record and append it to the WAL. has_ttl only
+// applies to SET records -- when set, a trailing 4-byte expires_at
+// (absolute epoch seconds, 0 = never) follows the value.
 static int append_record(kv_wal_t *wal, uint8_t opcode, const uint8_t *key,
                           uint16_t key_len, const uint8_t *value,
-                          uint32_t value_len) {
+                          uint32_t value_len, int has_ttl,
+                          uint32_t expires_at) {
     int has_value = (opcode == KV_OP_SET);
-    uint32_t payload_len = 2 + key_len + (has_value ? 4 + value_len : 0);
+    uint32_t payload_len = 2 + key_len +
+        (has_value ? 4 + value_len + (has_ttl ? 4 : 0) : 0);
 
     uint8_t *payload = malloc(payload_len ? payload_len : 1);
     if (payload == NULL) return -1;
@@ -51,7 +55,7 @@ static int append_record(kv_wal_t *wal, uint8_t opcode, const uint8_t *key,
     payload[1] = (uint8_t)key_len;
     memcpy(payload + 2, key, key_len);
 
-    // Store the value length and value for SET.
+    // Store the value length, value, and expiry for SET.
     if (has_value) {
         uint32_t off = 2 + key_len;
         payload[off] = (uint8_t)(value_len >> 24);
@@ -59,6 +63,14 @@ static int append_record(kv_wal_t *wal, uint8_t opcode, const uint8_t *key,
         payload[off + 2] = (uint8_t)(value_len >> 8);
         payload[off + 3] = (uint8_t)value_len;
         memcpy(payload + off + 4, value, value_len);
+
+        if (has_ttl) {
+            uint32_t ttl_off = off + 4 + value_len;
+            payload[ttl_off] = (uint8_t)(expires_at >> 24);
+            payload[ttl_off + 1] = (uint8_t)(expires_at >> 16);
+            payload[ttl_off + 2] = (uint8_t)(expires_at >> 8);
+            payload[ttl_off + 3] = (uint8_t)expires_at;
+        }
     }
 
     // Add the normal KV protocol header.
@@ -69,8 +81,9 @@ static int append_record(kv_wal_t *wal, uint8_t opcode, const uint8_t *key,
         return -1;
     }
 
+    uint8_t flags = has_ttl ? KV_FLAG_HAS_TTL : 0x00;
     size_t frame_len =
-        kv_encode_response(opcode, payload, payload_len, frame_buf, frame_cap);
+        kv_encode_frame(opcode, flags, payload, payload_len, frame_buf, frame_cap);
 
     free(payload);
 
@@ -95,12 +108,20 @@ static int append_record(kv_wal_t *wal, uint8_t opcode, const uint8_t *key,
 // Add a SET operation to the WAL.
 int kv_wal_append_set(kv_wal_t *wal, const uint8_t *key, uint16_t key_len,
                        const uint8_t *value, uint32_t value_len) {
-    return append_record(wal, KV_OP_SET, key, key_len, value, value_len);
+    return append_record(wal, KV_OP_SET, key, key_len, value, value_len, 0, 0);
+}
+
+// Add a SET operation with an absolute expiry to the WAL.
+int kv_wal_append_set_ttl(kv_wal_t *wal, const uint8_t *key, uint16_t key_len,
+                           const uint8_t *value, uint32_t value_len,
+                           uint32_t expires_at) {
+    return append_record(wal, KV_OP_SET, key, key_len, value, value_len, 1,
+                          expires_at);
 }
 
 // Add a DELETE operation to the WAL.
 int kv_wal_append_delete(kv_wal_t *wal, const uint8_t *key, uint16_t key_len) {
-    return append_record(wal, KV_OP_DELETE, key, key_len, NULL, 0);
+    return append_record(wal, KV_OP_DELETE, key, key_len, NULL, 0, 0, 0);
 }
 
 // Clear the WAL file.
@@ -173,6 +194,71 @@ int kv_wal_replay(const char *path, kv_wal_replay_set_fn on_set,
         }
 
         // Move to the next record.
+        offset += frame.frame_len;
+    }
+
+    free(buf);
+    return 0;
+}
+
+// Same as kv_wal_replay(), but on_set also receives each SET record's
+// absolute expiry timestamp. 
+int kv_wal_replay_ttl(const char *path, kv_wal_replay_set_ttl_fn on_set,
+                       kv_wal_replay_delete_fn on_delete, void *ctx) {
+    FILE *f = fopen(path, "rb");
+
+    if (f == NULL) return 0;
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (size < 0) {
+        fclose(f);
+        return -1;
+    }
+
+    uint8_t *buf = malloc((size_t)size ? (size_t)size : 1);
+
+    if (buf == NULL) {
+        fclose(f);
+        return -1;
+    }
+
+    size_t n = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+
+    if (n != (size_t)size) {
+        free(buf);
+        return -1;
+    }
+
+    size_t offset = 0;
+
+    while (offset < n) {
+        kv_frame_t frame;
+        int prc = kv_parse_frame(buf + offset, n - offset, &frame);
+
+        
+        if (prc != 1) {
+            break;
+        }
+
+        kv_command_t cmd;
+
+        if (kv_decode_command(&frame, &cmd) != 0) {
+            break;
+        }
+
+        if (frame.opcode == KV_OP_SET) {
+            uint32_t expires_at = cmd.has_ttl ? cmd.ttl_field : 0;
+            on_set(cmd.key, cmd.key_len, cmd.value, cmd.value_len, expires_at, ctx);
+        } else if (frame.opcode == KV_OP_DELETE) {
+            on_delete(cmd.key, cmd.key_len, ctx);
+        } else {
+            break;
+        }
+
         offset += frame.frame_len;
     }
 

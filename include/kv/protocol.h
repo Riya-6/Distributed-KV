@@ -21,11 +21,15 @@
 #define KV_OP_NOT_FOUND 0x84
 #define KV_OP_ERR 0x85
 
+/* Flags byte, header offset 6. */
+#define KV_FLAG_HAS_TTL 0x01
+
 typedef struct {
     uint8_t opcode;
+    uint8_t flags;
     uint32_t payload_len;
-    const uint8_t *payload; 
-    size_t frame_len;       
+    const uint8_t *payload;
+    size_t frame_len;
 } kv_frame_t;
 
 

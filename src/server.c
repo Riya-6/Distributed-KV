@@ -1,5 +1,4 @@
-/* Exposes usleep() from <unistd.h> under -std=c11 -- see Phase 1's
- * stage 4/5 test files for why. Must precede all includes. */
+
 #define _DEFAULT_SOURCE
 
 #include "kv/server.h"
@@ -71,11 +70,14 @@ static void dispatch(const kv_command_t *cmd, uint8_t *resp_opcode,
     }
 
     case KV_CMD_SET: {
-        int rc = kv_store_set(
+        uint32_t ttl_seconds = cmd->has_ttl ? cmd->ttl_field : 0;
+
+        int rc = kv_store_set_ttl(
             cmd->key,
             cmd->key_len,
             cmd->value,
-            cmd->value_len
+            cmd->value_len,
+            ttl_seconds
         );
 
         *resp_opcode = (rc == 0) ? KV_OP_OK : KV_OP_ERR;

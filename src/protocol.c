@@ -20,6 +20,7 @@ int kv_parse_frame(const uint8_t *buf, size_t buf_len, kv_frame_t *out) {
     if (buf_len < frame_len) return 0; // payoad not fully received yet
 
     out->opcode = buf[1];
+    out->flags = buf[6];
     out->payload_len = payload_len;
     out->payload = payload_len ? buf + KV_HEADER_LEN : NULL;
     out->frame_len = frame_len;

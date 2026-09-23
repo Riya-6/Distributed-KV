@@ -30,17 +30,24 @@ int main(int argc, char **argv) {
     const char *data_dir = argv[1];
     uint16_t port = (uint16_t)atoi(argv[2]);
 
-    if (kv_store_open(data_dir) != 0) {
-        fprintf(stderr, "kv_store_open failed for %s\n", data_dir);
-        return 1;
-    }
-
-    // Block SIGTERM/SIGINT on this thread so sigwait() can catch them synchronously on the dedicated shutdown thread below.
+    // Block SIGTERM/SIGINT here, before any other thread is created
+    // (including kv_store_open()'s Phase 6 sweep thread) -- a new
+    // thread inherits the creating thread's signal mask, so every
+    // thread this process ever has needs to be born with these
+    // already blocked. Otherwise a stray SIGTERM can land on some
+    // other thread that never calls sigwait() and has no handler,
+    // killing the process via the default disposition instead of
+    // being caught here.
     sigset_t set;
     sigemptyset(&set);
     sigaddset(&set, SIGTERM);
     sigaddset(&set, SIGINT);
     pthread_sigmask(SIG_BLOCK, &set, NULL);
+
+    if (kv_store_open(data_dir) != 0) {
+        fprintf(stderr, "kv_store_open failed for %s\n", data_dir);
+        return 1;
+    }
 
     pthread_t shutdown_th;
     if (pthread_create(&shutdown_th, NULL, shutdown_signal_thread, &set) != 0) {

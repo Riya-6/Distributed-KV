@@ -10,11 +10,14 @@
 #include "kv/command.h"
 #include "kv/protocol.h"
 
-// Write one memtable entry to the SSTable.
+// Write one memtable entry to the SSTable. A live (non-tombstone)
+// entry always carries the trailing 4-byte expires_at field (0 =
+// never expires) -- unlike the network wire format, there's no reason
+// to make this field optional on disk, so it's unconditional here.
 static int write_entry(FILE *f, const kv_entry_view_t *view) {
     uint8_t opcode = view->is_tombstone ? KV_OP_DELETE : KV_OP_SET;
     uint32_t payload_len =
-        2 + view->key_len + (view->is_tombstone ? 0 : 4 + view->value_len);
+        2 + view->key_len + (view->is_tombstone ? 0 : 4 + view->value_len + 4);
 
     uint8_t *payload = malloc(payload_len ? payload_len : 1);
     if (payload == NULL) return -1;
@@ -24,7 +27,7 @@ static int write_entry(FILE *f, const kv_entry_view_t *view) {
     payload[1] = (uint8_t)view->key_len;
     memcpy(payload + 2, view->key, view->key_len);
 
-    // Store the value length and value for normal entries.
+    // Store the value length, value, and expiry for normal entries.
     if (!view->is_tombstone) {
         uint32_t off = 2 + view->key_len;
         payload[off] = (uint8_t)(view->value_len >> 24);
@@ -32,6 +35,12 @@ static int write_entry(FILE *f, const kv_entry_view_t *view) {
         payload[off + 2] = (uint8_t)(view->value_len >> 8);
         payload[off + 3] = (uint8_t)view->value_len;
         memcpy(payload + off + 4, view->value, view->value_len);
+
+        uint32_t ttl_off = off + 4 + view->value_len;
+        payload[ttl_off] = (uint8_t)(view->expires_at >> 24);
+        payload[ttl_off + 1] = (uint8_t)(view->expires_at >> 16);
+        payload[ttl_off + 2] = (uint8_t)(view->expires_at >> 8);
+        payload[ttl_off + 3] = (uint8_t)view->expires_at;
     }
 
     // Add the KV protocol header.
@@ -43,8 +52,9 @@ static int write_entry(FILE *f, const kv_entry_view_t *view) {
         return -1;
     }
 
+    uint8_t flags = view->is_tombstone ? 0x00 : KV_FLAG_HAS_TTL;
     size_t frame_len =
-        kv_encode_response(opcode, payload, payload_len, frame_buf, frame_cap);
+        kv_encode_frame(opcode, flags, payload, payload_len, frame_buf, frame_cap);
 
     free(payload);
 
@@ -257,10 +267,11 @@ static int find_index(kv_sstable_t *sst, const uint8_t *key, uint16_t key_len,
     return 0;
 }
 
-// Look up a key in the SSTable.
-kv_lookup_result_t kv_sstable_get(kv_sstable_t *sst, const uint8_t *key,
-                                   uint16_t key_len, uint8_t **out_value,
-                                   uint32_t *out_value_len) {
+// Look up a key in the SSTable, also reporting its expiry.
+kv_lookup_result_t kv_sstable_get_ttl(kv_sstable_t *sst, const uint8_t *key,
+                                       uint16_t key_len, uint8_t **out_value,
+                                       uint32_t *out_value_len,
+                                       uint32_t *out_expires_at) {
     size_t idx;
 
     if (!find_index(sst, key, key_len, &idx)) {
@@ -293,8 +304,18 @@ kv_lookup_result_t kv_sstable_get(kv_sstable_t *sst, const uint8_t *key,
 
     *out_value = copy;
     *out_value_len = cmd.value_len;
+    *out_expires_at = cmd.has_ttl ? cmd.ttl_field : 0;
 
     return KV_LOOKUP_HIT;
+}
+
+// Look up a key in the SSTable.
+kv_lookup_result_t kv_sstable_get(kv_sstable_t *sst, const uint8_t *key,
+                                   uint16_t key_len, uint8_t **out_value,
+                                   uint32_t *out_value_len) {
+    uint32_t unused_expires_at;
+    return kv_sstable_get_ttl(sst, key, key_len, out_value, out_value_len,
+                               &unused_expires_at);
 }
 
 // Return the number of entries in the SSTable.
@@ -323,6 +344,7 @@ int kv_sstable_entry_at(kv_sstable_t *sst, size_t index, kv_entry_view_t *out) {
     out->is_tombstone = sst->index[index].is_tombstone;
     out->value = out->is_tombstone ? NULL : cmd.value;
     out->value_len = out->is_tombstone ? 0 : cmd.value_len;
+    out->expires_at = (!out->is_tombstone && cmd.has_ttl) ? cmd.ttl_field : 0;
 
     return 0;
 }
@@ -409,11 +431,12 @@ int kv_sstable_compact(const char **paths, size_t count, const char *out_path) {
 
         // Keep the newest value if it is not deleted.
         if (!newest_view.is_tombstone) {
-            kv_memtable_put(merged,
-                            newest_view.key,
-                            newest_view.key_len,
-                            newest_view.value,
-                            newest_view.value_len);
+            kv_memtable_put_ttl(merged,
+                                newest_view.key,
+                                newest_view.key_len,
+                                newest_view.value,
+                                newest_view.value_len,
+                                newest_view.expires_at);
         }
 
         // Drop the key if its newest version is a tombstone.
