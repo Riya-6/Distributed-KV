@@ -1,10 +1,9 @@
-# Distributed KV Store
+# Concurrent KV Store
 
-A distributed key-value store built from scratch in C: a custom wire
+A concurrent key-value store built from scratch in C: a custom wire
 protocol over raw POSIX sockets, an LSM-tree storage engine (memtable +
-SSTables + compaction), pthread-based concurrent client handling, TTL
-expiry, and single-primary/single-replica replication over the same
-custom protocol.
+SSTables + compaction), pthread-based concurrent client handling and TTL
+expiry.
 
 ## What this is
 
@@ -17,17 +16,12 @@ custom protocol.
   specifically because its failure modes are contained (a compaction bug
   degrades read performance; it doesn't corrupt the on-disk structure the
   way a torn B-tree page split can) 
-- **GET / SET / DELETE**, plus a range scan that exercises the LSM
-  index's sorted iteration.
+- **GET / SET / DELETE** with sorted iteration used internally by the LSM index.
 - **Real concurrency** — pthreads per client connection, real locking
   around the index/storage layer.
 - **Crash-safe persistence** tied to the LSM design (WAL + SSTables), with
   explicit crash-recovery tests.
 - **TTL/expiry** — lazy (checked on read) and an active background sweep.
-- **Leader-follower replication** — one primary, one replica, write
-  propagation over the same wire protocol, plus honest handling of
-  replica lag and disconnect/resync
-- **A minimal CLI client** speaking the same protocol.
 
 
 ## Stack
@@ -69,7 +63,3 @@ make test-p1                          # build + run every phase 1 stage test
 make valgrind-p1                      # same, under valgrind --leak-check=full
 ```
 
-## Benchmarks
-
-Real ops/sec, latency-under-load, compaction overhead, and replication
-lag numbers get logged as they're actually measured in [`docs/metrics.md`](docs/metrics.md).
